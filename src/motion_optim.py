@@ -186,10 +186,10 @@ def motion_prior_loss(latent_motion_pred):
 
 
 class HMPModel:
-    def __init__(self, f=5000.0):
+    def __init__(self, config_path='./configs', f=5000.0):
         # load model
         args = Arguments(
-            './configs', filename='in_the_wild_sample_config.yaml')
+            config_path, filename='in_the_wild_sample_config.yaml')
         args.dataname = "in_the_wild"
         ngpu = 1
         model = Architecture(args, ngpu)
@@ -474,7 +474,10 @@ class HMPModel:
         init_cam_orient = matrix_to_rotation_6d(init_cam_orient)
 
         full_cam_R = matrix_to_rotation_6d(cam_R.clone())
-        full_cam_t = torch.zeros_like(cam_t)
+
+        # FIXME: why it sets translation to 0?
+        # full_cam_t = torch.zeros_like(cam_t)
+        full_cam_t = cam_t.clone()
 
         # take pymafx mean as starting point
         mean_betas = target["betas"].mean(dim=1).mean(dim=0)
@@ -594,6 +597,8 @@ class HMPModel:
         target['root_orient'] = input_data.root_orient.to(self.model.device)
         target['cam_R'] = input_data.cam_R.to(self.model.device)
         target['cam_t'] = input_data.cam_t.to(self.model.device)
+
+
         target['cam_f'] = input_data.cam_f.to(self.model.device).squeeze(0)
 
         self.f = target['cam_f'][0, 0].item()
@@ -612,6 +617,8 @@ class HMPModel:
         # target['handedness'] = gt_values['handedness']
 
         # refre: applicatgion.py:load_aist_data()
+
+        # FIXME: need to bring to local camera coordinate
         data = {
             # for encode_local
             "pos": target["pos"],
@@ -633,6 +640,12 @@ class HMPModel:
             target["trans"], dt=1.0 / self.args.data.fps).squeeze(0)
 
         self.model.set_input(data)
+
+        raw_input = target["cam_R"], target["cam_t"], target["trans"], target["root_orient"], target[
+            "betas"], target["joints2d"], target["joints3d"], target["pos"], target["rotmat"]
+        joblib.dump(raw_input, f'{self.args.pkl_output_dir}/raw_input.pkl')
+
+
         z_l, _, _ = self.model.encode_local()
         z_g, _, _ = self.model.encode_global()
 
@@ -672,248 +685,8 @@ class HMPModel:
 if __name__ == "__main__":
     hmp = HMPModel(f=None)
     input_data = load_hot3d_folder("../hot3d_clips_data/clip-001849")
+    # corrupt the perfect input data with manual noise
+    trans_noise_mean = 0.1 * input_data.trans.mean(dim=1)
+    input_data.trans += torch.randn_like(input_data.trans) * trans_noise_mean
     output, joints3d_pred, vertices_pred, joints2d_pred, optim_cam_R, optim_cam_t = hmp.run(
         input_data)
-
-
-# args = Arguments(
-#     './configs', filename='in_the_wild_sample_config.yaml')
-# args.dataname = "in_the_wild"
-# ngpu = 1
-# model = Architecture(args, ngpu)
-# model.load_model(optimal=True)
-# model.eval()
-# # setup input data (hand, camera)
-# target = ...
-
-
-# data = {
-#     # for encode_local
-#     "pos": None,
-#     "veclocity": None,
-#     "global_xforms": None,
-#     "angular": None,
-#     # for encode_global
-#     "root_orient": None,
-#     "root_vel": None,
-# }
-
-# model.set_input(data)
-# step = 1.0
-# # FIXME: this encode step relies on model.input_data is setup beforehand
-# # for now, it will make use of data setup in the previous cell
-# z_l, _, _ = model.encode_local()
-# z_g, _, _ = model.encode_global()
-
-# # FIXME: explicitly write down what is needed in target
-# # optimize pose directly
-# # pose_aa = matrix_to_axis_angle(model.input_data["rotmat"].detach(
-# # ).clone()) if motion_prior_type in ['gmm', 'pca'] else None
-
-# pose_aa = None
-
-# z_l, z_g, opt_betas, opt_root_orient, opt_trans, cam_R, cam_t, opt_pose_aa = latent_optimization(
-#     target, T=T, z_l=z_l, z_g=z_g, pose=pose_aa)
-# output = model.decode(
-#     z_l, z_g=z_g, length=args.data.clip_length, step=step)
-# # out of box after decode, it has keys: ['rotmat', 'pos', 'root_orient']
-# # (2, 128, 16, 3, 3); (2, 128, 16, 3); (2, 128, 6)
-
-# # opt_beta, opt_root_orient, opt_trans, cam_R, cam_t
-# # (1, 10); (2, 128, 6); (2, 128, 3); (2, 128, 6); (2, 128, 3)
-
-# output['betas'] = opt_betas[:, None, None, :].repeat(1, B, seqlen, 1)
-# output['trans'] = opt_trans.clone().reshape(B*args.nsubject, seqlen, 3)
-
-# # notice, the value in original output['root_orient'] is very different from opt_root_orient
-# output['root_orient'] = opt_root_orient
-
-# rh_mano_out = forward_mano(output)
-# joints3d_pred = rh_mano_out.joints.view(B, seqlen, -1, 3)
-# vertices_pred = rh_mano_out.vertices.view(B, seqlen, -1, 3)
-
-# optim_cam_R = rotation_6d_to_matrix(cam_R)
-# optim_cam_t = cam_t
-
-# joints2d_pred = get_joints2d(joints3d_pred=joints3d_pred,
-#                              cam_t=optim_cam_t.unsqueeze(
-#                                  0).repeat_interleave(args.nsubject, 0),
-#                              cam_R=optim_cam_R.unsqueeze(
-#                                  0).repeat_interleave(args.nsubject, 0),
-#                              cam_f=torch.tensor([5000., 5000.]),
-#                              cam_center=target['cam_center'])
-
-
-# decode form latent space to hand pose
-
-# steps = [1.0]
-# for step in steps:
-#     with torch.no_grad():
-#         B, seqlen, _ = opt_trans.shape
-
-#         # if motion_prior_type in ["pca", "gmm"]:
-#         #     output = {"rotmat": axis_angle_to_matrix(opt_pose_aa)}
-#         # else:
-#         #     output = model.decode(
-#         #         z_l, z_g=z_g, length=args.data.clip_length, step=step)
-
-#         output = model.decode(
-#             z_l, z_g=z_g, length=args.data.clip_length, step=step)
-
-#         output['betas'] = opt_betas[:, None, None, :].repeat(1, B, seqlen, 1)
-#         output['trans'] = opt_trans.clone().reshape(B*args.nsubject, seqlen, 3)
-#         output['root_orient'] = opt_root_orient
-
-#         rh_mano_out = forward_mano(output)
-#         joints3d_pred = rh_mano_out.joints.view(B, seqlen, -1, 3)
-#         vertices_pred = rh_mano_out.vertices.view(B, seqlen, -1, 3)
-
-#         optim_cam_R = rotation_6d_to_matrix(cam_R)
-#         optim_cam_t = cam_t
-
-#         joints2d_pred = get_joints2d(joints3d_pred=joints3d_pred,
-#                                      cam_t=optim_cam_t.unsqueeze(
-#                                          0).repeat_interleave(args.nsubject, 0),
-#                                      cam_R=optim_cam_R.unsqueeze(
-#                                          0).repeat_interleave(args.nsubject, 0),
-#                                      cam_f=torch.tensor([5000., 5000.]),
-#                                      cam_center=target['cam_center'])
-
-#     fps = int(args.data.fps / step)
-#     # criterion_geo = GeodesicLoss()
-
-#     rotmat = output['rotmat']  # (B, T, J, 3, 3)
-#     rotmat_gt = target['rotmat']  # (B, T, J, 3, 3)
-#     b_size, _, n_joints = rotmat.shape[:3]
-
-#     local_rotmat = fk.global_to_local(
-#         rotmat.view(-1, n_joints, 3, 3))  # (B x T, J, 3, 3)
-#     local_rotmat = local_rotmat.view(b_size, -1, n_joints, 3, 3)
-#     local_rotmat_gt = fk.global_to_local(
-#         rotmat_gt.view(-1, n_joints, 3, 3))  # (B x T, J, 3, 3)
-#     local_rotmat_gt = local_rotmat_gt.view(b_size, -1, n_joints, 3, 3)
-
-#     root_orient = rotation_6d_to_matrix(opt_root_orient)  # (B, T, 3, 3)
-#     root_orient_gt = rotation_6d_to_matrix(
-#         target['root_orient'])  # (B, T, 3, 3)
-
-#     global_trans = opt_trans.clone()
-#     B = global_trans.shape[0]
-
-#     if args.data.root_transform:
-#         local_rotmat[:, :, 0] = root_orient
-#         local_rotmat_gt[:, :, 0] = root_orient_gt
-
-#     trans = global_trans
-#     trans_gt = target['trans']  # (B, T, 3)
-
-#     # concatenate results in a certain way (what for?)
-#     if trans.shape[0] > 1:
-
-#         # batch optimization
-#         if args.overlap_len == 0:
-#             # concat_results
-#             trans = trans.reshape(1, -1, 3)
-#             trans_gt = trans_gt.reshape(1, -1, 3)
-#             local_rotmat = local_rotmat.reshape(1, -1, n_joints, 3, 3)
-#             local_rotmat_gt = local_rotmat_gt.reshape(1, -1, n_joints, 3, 3)
-#             cam_R = target['cam_R'].reshape(1, -1, 3, 3)
-#             cam_t = target['cam_t'].reshape(1, -1, 3)
-#             joints2d_pred = joints2d_pred.reshape(
-#                 1, -1, *joints2d_pred.shape[2:])
-#             joints3d_pred = joints3d_pred.reshape(
-#                 1, -1, *joints3d_pred.shape[2:])
-#             vertices_pred = vertices_pred.reshape(
-#                 1, -1, *vertices_pred.shape[2:])
-
-#             for k, v in target.items():
-#                 if not (k in ['cam_f', 'cam_center', 'img_height', 'img_width', 'img_dir', 'save_path', 'frame_id', 'config_type', 'rh_verts', 'handedness']):
-
-#                     target[k] = v.reshape(1, -1, * v.shape[2:])
-
-#         else:
-#             B, T, J, _, _ = output["rotmat"].shape
-
-#             def resh(x): return x.reshape(1, B, *x.shape[1:])
-
-#             def concat(x):
-#                 x = resh(x)
-#                 ls = [x[:, 0]]
-#                 for bid in range(1, x.shape[1]):
-#                     ls.append(x[:, bid, args.overlap_len:])
-#                 return torch.cat(ls, dim=1)[:, :args.orig_seq_len]
-
-#             # concat_cam = lambda x: torch.cat([x[0]] + [y[args.overlap_len:] for y in x[1:]], dim=0).unsqueeze(0)[:, :args.orig_seq_len]
-#             trans = concat(trans)
-#             trans_gt = concat(trans_gt)
-#             local_rotmat = concat(local_rotmat)
-#             local_rotmat_gt = concat(local_rotmat_gt)
-#             cam_R = target['cam_R'].reshape(1, -1, 3, 3)
-#             cam_t = target['cam_t'].reshape(1, -1, 3)
-#             joints2d_pred = concat(joints2d_pred)
-#             joints3d_pred = concat(joints3d_pred)
-#             vertices_pred = concat(vertices_pred)
-
-#             for k, v in target.items():
-#                 if not (k in IGNORE_KEYS):
-#                     target[k] = concat(v)
-
-# dump results
-# for i in range(local_rotmat.shape[0]): # (1, T. J, 3, 3)
-
-#     poses = c2c(matrix_to_axis_angle(local_rotmat[i]))  # (T, J, 3)
-#     poses_gt = c2c(matrix_to_axis_angle(local_rotmat_gt[i]))  # (T, J, 3)
-
-#     poses = poses.reshape((poses.shape[0], -1))  # (T, 48)
-#     poses_gt = poses_gt.reshape((poses_gt.shape[0], -1))  # (T, 66)
-
-#     limit = poses.shape[0]
-
-#     pred_save_path = os.path.join(output_dir, f'recon_{offset + i:03d}_{fps}fps.npz')
-#     gt_save_path = pred_save_path if args.raw_config else os.path.join(output_dir, f'recon_{offset + i:03d}_gt.npz')
-
-#     # save opt results if not _pymafx_raw or _metro_raw
-#     if not args.raw_config:
-#         np.savez(pred_save_path,
-#                 poses=poses[:limit],
-#                 trans=c2c(trans[i][:limit]),
-#                 betas=opt_betas.detach().cpu().numpy()[:limit],
-#                 gender=args.data.gender,
-#                 mocap_framerate=fps,
-#                 cam_R=c2c(target['cam_R'][i][0]),
-#                 cam_t=c2c(target["cam_t"][i][0]),
-#                 cam_f=c2c(target['cam_f'].unsqueeze(0)),
-#                 cam_center=c2c(target['cam_center'].unsqueeze(0)),
-#                 joints_2d=c2c(joints2d_pred[i][:limit]),
-#                 keypoints_2d=c2c(target['joints2d'][i][:limit]),  # detected keypoints with confidence
-#                 vertices=c2c(vertices_pred[i][:limit]),
-#                 save_path=pred_save_path,
-#                 handedness=target["handedness"],
-#                 img_dir=str(target['img_dir']),
-#                 frame_id=target['frame_id'],
-#                 img_height=target['img_height'],
-#                 img_width=target['img_width'],
-#                 config_type=target['config_type'],
-#                 joints_3d=c2c(joints3d_pred)[i][:limit])
-
-#     if ("_encode_decode" in gt_save_path) or args.raw_config:
-#         np.savez(gt_save_path,
-#                 poses=poses_gt[:limit],
-#                 trans=c2c(trans_gt[i][:limit]),
-#                 betas=target["betas"][0].detach().cpu().numpy()[:limit],
-#                 vertices=target["rh_verts"].detach().cpu().numpy()[:limit],
-#                 config_type=target['config_type'] if args.raw_config else None,
-#                 gender=args.data.gender,
-#                 save_path=gt_save_path,
-#                 mocap_framerate=args.data.fps,
-#                 frame_id=target['frame_id'],
-#                 img_height=target['img_height'],
-#                 img_width=target['img_width'],
-#                 cam_R=c2c(target['cam_R'][i][0]),
-#                 cam_t=c2c(target['cam_t'][i][0]),
-#                 cam_f=c2c(target['cam_f'].unsqueeze(0)),
-#                 cam_center=c2c(target['cam_center'].unsqueeze(0)),
-#                 joints2d=c2c(target['joints2d'][i, ...,])[:limit],
-#                 joints_2d=c2c(target['joints2d'][i, ...,])[:limit],
-#                 keypoints_2d=c2c(target['joints2d'][i, ...,])[:limit], # duplicated, because alignment reads that key value
-#                 joints_3d=c2c(target['joints3d'][i])[:limit])
