@@ -6,6 +6,14 @@ Conceptually, it takes a joint camera and hand pose trajctory,
 and it returns a refined hand pose trajectory, via the latent optimization of learned NeMF.
 
 """
+from pathlib import Path
+# from pimax_optitrack_loader import load_frame_data
+from rotations import (
+    euler_angles_to_matrix,
+    quaternion_to_matrix,
+    rotation_6d_to_matrix,
+)
+import numpy as np
 import os
 import time
 from dataclasses import dataclass
@@ -16,10 +24,10 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
-from fitting_utils import get_joints2d, joints2d_loss
+from fitting_utils import get_joints2d, joints2d_loss, perspective_projection
 from hot3d_loader import load_hot3d_folder
 from nemf.generative import Architecture
-from nemf.fk import ForwardKinematicsLayer
+from fk import ForwardKinematicsLayer
 from rotations import rotation_6d_to_matrix, matrix_to_axis_angle, matrix_to_rotation_6d
 from arguments import Arguments
 from nemf.losses import GeodesicLoss, pos_smooth_loss, rot_smooth_loss
@@ -56,6 +64,24 @@ def forward_mano(output, fk, hand_model):
                                       "transl": output['trans'].view(-1, 3)})
 
     return mano_out
+
+
+def forward_mano_reproject2d(output, fk, hand_model, cam_param, B, T):
+    cam_t, cam_R, cam_f, cam_center = cam_param
+    rh_mano_out = forward_mano(output, fk, hand_model)
+    joints3d = rh_mano_out.joints.view(B, T, -1, 3)
+
+    # we need further customization than the original get_joints2d function
+    # we don't repeat the camera parameters, since they are different across frames
+    flatten_shape = B * T
+    joints2d_pred = perspective_projection(
+        joints3d.view((flatten_shape, -1, 3)),
+        cam_R.view((flatten_shape, 3, 3)),
+        cam_t.view((flatten_shape, 3)),
+        cam_f.view((flatten_shape, 2)),
+        cam_center.view((flatten_shape, 2)),
+    )
+    return joints2d_pred.view(B, T, -1, 2), joints3d
 
 
 def L_rot(pred, gt, T, conf=None, use_geodesic_loss=True, use_l1_loss=True):
@@ -186,10 +212,10 @@ def motion_prior_loss(latent_motion_pred):
 
 
 class HMPModel:
-    def __init__(self, config_path='./configs', f=5000.0):
+    def __init__(self, f=5000.0):
         # load model
         args = Arguments(
-            config_path, filename='in_the_wild_sample_config.yaml')
+            './configs', filename='in_the_wild_sample_config.yaml')
         args.dataname = "in_the_wild"
         ngpu = 1
         model = Architecture(args, ngpu)
@@ -199,8 +225,8 @@ class HMPModel:
         self.args = args
         self.args.pkl_output_dir = "/workspace/project/egocentric/HMP/my_res"
         self.model = model
-        self.fk = ForwardKinematicsLayer(args)
         MANO_RH_DIR = "./data/body_models/mano/MANO_RIGHT.pkl"
+        self.fk = ForwardKinematicsLayer(MANO_RH_DIR)
         self.hand_model = BodyModel(model_type="mano", model_path=MANO_RH_DIR, device='cuda',
                                     **{"flat_hand_mean": True, "use_pca": False,
                                        #    "batch_size": args.N_frames,
@@ -243,6 +269,7 @@ class HMPModel:
 
         # optimize the z_l and root_orient, pos, trans, 2d kp objectives
         start_time = time.time()
+        log_step = 50
         for i in range(stg_conf.niters):
 
             optimizer.zero_grad()
@@ -265,21 +292,33 @@ class HMPModel:
             output['trans'] = global_trans
             output['root_orient'] = root_orient
 
-            rh_mano_out = forward_mano(output, self.fk, self.hand_model)
-            joints3d = rh_mano_out.joints.view(B, seqlen, -1, 3)
-            # vertices3d = rh_mano_out.vertices.view(B, seqlen, -1, 3)
+            # rh_mano_out = forward_mano(output, self.fk, self.hand_model)
+            # joints3d = rh_mano_out.joints.view(B, seqlen, -1, 3)
+            # # vertices3d = rh_mano_out.vertices.view(B, seqlen, -1, 3)
 
             optim_cam_R = rotation_6d_to_matrix(full_cam_R)
             optim_cam_t = full_cam_t
 
-            joints2d_pred = get_joints2d(joints3d_pred=joints3d,
-                                         cam_t=optim_cam_t.unsqueeze(
-                                             0).repeat_interleave(args.nsubject, 0),
-                                         cam_R=optim_cam_R.unsqueeze(
-                                             0).repeat_interleave(args.nsubject, 0),
-                                         cam_f=torch.tensor([self.f, self.f]),
-                                         cam_center=target['cam_center'])
+            # joints2d_pred = get_joints2d(joints3d_pred=joints3d,
+            #                              cam_t=optim_cam_t.unsqueeze(
+            #                                  0).repeat_interleave(args.nsubject, 0),
+            #                              cam_R=optim_cam_R.unsqueeze(
+            #                                  0).repeat_interleave(args.nsubject, 0),
+            #                              cam_f=torch.tensor([self.f, self.f]),
+            #                              cam_center=target['cam_center'])
 
+            cam_f = target["cam_f"].unsqueeze(-1).repeat_interleave(2, -1)
+            cam_center = target["cam_center"].unsqueeze(
+                -1).repeat_interleave(2, -1)
+
+            joints2d_pred, joints3d = forward_mano_reproject2d(
+                output,
+                self.fk,
+                self.hand_model,
+                (optim_cam_t, optim_cam_R, cam_f, cam_center),
+                B,
+                seqlen,
+            )
             output['joints2d'] = joints2d_pred
             output['joints3d'] = joints3d
 
@@ -291,6 +330,7 @@ class HMPModel:
             local_rotmat = local_rotmat.view(
                 B*args.nsubject, -1, HAND_JOINT_NUM, 3, 3)  # (B x T, J, 3, 3)
 
+            # FIXME: this seems to be wrong, why not the logic in motion reconstruction?
             local_rotmat_gt = target['rotmat']
             loss_dict = {}
 
@@ -425,6 +465,11 @@ class HMPModel:
                 loss_dict[k] = v.item()
                 loss_log_str += f'{k}: {v.item():.3f}\t'
             logger.info(loss_log_str)
+            if i % log_step == 0:
+                joblib.dump(
+                    (output, joints3d, joints2d_pred, None, None),
+                    f"{self.args.pkl_output_dir}/stg_{stg_id+1}_step_{i}_res.pkl",
+                )
 
         end_time = time.time()
 
@@ -559,6 +604,51 @@ class HMPModel:
                                    z_l, z_global, betas, target, B, seqlen,
                                    mean_betas, T, full_cam_R, full_cam_t)
 
+                with torch.no_grad():
+                    step = 1.0
+                    B, seqlen, _ = optim_trans.shape
+                    output = self.model.decode(
+                        z_l, z_g=z_global, length=self.args.data.clip_length, step=step
+                    )
+                    output["betas"] = betas[:, None,
+                                            None, :].repeat(1, B, seqlen, 1)
+                    output["trans"] = optim_trans.clone().reshape(
+                        B * self.args.nsubject, seqlen, 3
+                    )
+
+                    # notice, the value in original output['root_orient'] is very different from opt_root_orient
+                    output["root_orient"] = optim_root_orient
+
+                    optim_cam_R = rotation_6d_to_matrix(full_cam_R)
+                    optim_cam_t = full_cam_t
+                    cam_f = target["cam_f"].unsqueeze(
+                        -1).repeat_interleave(2, -1)
+                    cam_center = (
+                        target["cam_center"].unsqueeze(
+                            -1).repeat_interleave(2, -1)
+                    )
+
+                    joints2d_pred, joints3d_pred = forward_mano_reproject2d(
+                        output,
+                        self.fk,
+                        self.hand_model,
+                        (optim_cam_t, optim_cam_R, cam_f, cam_center),
+                        B,
+                        seqlen,
+                    )
+
+                    optim_res = (
+                        output,
+                        joints3d_pred,
+                        joints2d_pred,
+                        optim_cam_R,
+                        optim_cam_t,
+                    )
+
+                    joblib.dump(
+                        optim_res, f"{self.args.pkl_output_dir}/stg_{stg_id+1}_res.pkl"
+                    )
+
                 joblib.dump(stg_int_results,
                             f'{self.args.pkl_output_dir}/stg_{stg_id+1}.pkl')
                 logger.info(
@@ -597,16 +687,13 @@ class HMPModel:
         target['root_orient'] = input_data.root_orient.to(self.model.device)
         target['cam_R'] = input_data.cam_R.to(self.model.device)
         target['cam_t'] = input_data.cam_t.to(self.model.device)
-
-
-        target['cam_f'] = input_data.cam_f.to(self.model.device).squeeze(0)
-
-        self.f = target['cam_f'][0, 0].item()
-        target['cam_center'] = input_data.cam_center.to(
-            self.model.device).squeeze(0)
+        target["cam_f"] = input_data.cam_f.to(self.model.device)
+        target["cam_center"] = input_data.cam_center.to(self.model.device)
         target['joints2d'] = input_data.joint2d.to(self.model.device)
-        target['joints3d'] = input_data.joint3d.to(self.model.device)
+        if input_data.joint3d is not None:
+            target["joints3d"] = input_data.joint3d.to(self.model.device)
         target['betas'] = input_data.betas.to(self.model.device)
+        target["img_dir"] = input_data.img_dir
         # target['img_width'] = data['img_width']
         # target['img_height'] = data['img_height']
         # target['img_dir'] = data['img_dir']
@@ -617,8 +704,6 @@ class HMPModel:
         # target['handedness'] = gt_values['handedness']
 
         # refre: applicatgion.py:load_aist_data()
-
-        # FIXME: need to bring to local camera coordinate
         data = {
             # for encode_local
             "pos": target["pos"],
@@ -639,13 +724,29 @@ class HMPModel:
         data['root_vel'] = estimate_linear_velocity(
             target["trans"], dt=1.0 / self.args.data.fps).squeeze(0)
 
+        # record raw input data before any processing
+        output = {}
+        output["rotmat"] = rotation_6d_to_matrix(target["rotmat"])
+        output["root_orient"] = target["root_orient"]
+        output["betas"] = target["betas"]
+        output["trans"] = target["trans"]
+        cam_f = target["cam_f"].unsqueeze(-1).repeat_interleave(2, -1)
+        cam_center = target["cam_center"].unsqueeze(
+            -1).repeat_interleave(2, -1)
+        joints2d, joints3d = forward_mano_reproject2d(
+            output,
+            self.fk,
+            self.hand_model,
+            (target["cam_t"], target["cam_R"], cam_f, cam_center),
+            B=1,
+            T=128,
+        )
+        joblib.dump(
+            (output, joints3d, joints2d, None, None),
+            f"{self.args.pkl_output_dir}/input.pkl",
+        )
+
         self.model.set_input(data)
-
-        raw_input = target["cam_R"], target["cam_t"], target["trans"], target["root_orient"], target[
-            "betas"], target["joints2d"], target["joints3d"], target["pos"], target["rotmat"]
-        joblib.dump(raw_input, f'{self.args.pkl_output_dir}/raw_input.pkl')
-
-
         z_l, _, _ = self.model.encode_local()
         z_g, _, _ = self.model.encode_global()
 
@@ -671,15 +772,35 @@ class HMPModel:
 
             optim_cam_R = rotation_6d_to_matrix(cam_R)
             optim_cam_t = cam_t
+            # TODO
+            # joints2d_pred = get_joints2d(joints3d_pred=joints3d_pred,
+            #                              cam_t=optim_cam_t.unsqueeze(
+            #                                  0).repeat_interleave(self.args.nsubject, 0),
+            #                              cam_R=optim_cam_R.unsqueeze(
+            #                                  0).repeat_interleave(self.args.nsubject, 0),
+            #                              cam_f=torch.tensor([self.f, self.f]),
+            #                              cam_center=target['cam_center'])
+            cam_f = target["cam_f"].unsqueeze(-1).repeat_interleave(2, -1)
+            cam_center = target["cam_center"].unsqueeze(
+                -1).repeat_interleave(2, -1)
 
-            joints2d_pred = get_joints2d(joints3d_pred=joints3d_pred,
-                                         cam_t=optim_cam_t.unsqueeze(
-                                             0).repeat_interleave(self.args.nsubject, 0),
-                                         cam_R=optim_cam_R.unsqueeze(
-                                             0).repeat_interleave(self.args.nsubject, 0),
-                                         cam_f=torch.tensor([self.f, self.f]),
-                                         cam_center=target['cam_center'])
-        return output, joints3d_pred, vertices_pred, joints2d_pred, optim_cam_R, optim_cam_t
+            joints2d_pred, _ = forward_mano_reproject2d(
+                output,
+                self.fk,
+                self.hand_model,
+                (optim_cam_t, optim_cam_R, cam_f, cam_center),
+                B,
+                seqlen,
+            )
+
+        return (
+            output,
+            joints3d_pred,
+            vertices_pred,
+            joints2d_pred,
+            optim_cam_R,
+            optim_cam_t,
+        )
 
 
 if __name__ == "__main__":
